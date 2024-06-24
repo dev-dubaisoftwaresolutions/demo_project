@@ -1,0 +1,120 @@
+name: Build and Upload to TestFlight
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3.1'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          version: '3.19.0'
+
+
+      - name: Install dependencies
+        run: flutter pub get
+
+
+      - name: Install Fastlane
+        working-directory: ./ios
+        run: gem install fastlane
+
+      - name: Install Ruby dependencies
+        working-directory: ./ios
+        run: |
+          gem install bundler
+          bundle init
+          echo 'source "https://rubygems.org"' >> Gemfile
+          echo 'gem "fastlane"' >> Gemfile
+          echo 'gem "pilot"' >> Gemfile
+          bundle install
+
+      - name: Mark build directory as deletable
+        run: |
+          cd ios
+          mkdir -p build
+          xattr -w com.apple.xcode.CreatedByBuildSystem true build
+      
+      - name: Clean Xcode Project
+        run: |
+          cd ios
+          xcodebuild clean
+      
+      - name: Reset Package Caches
+        run: |
+          cd ios
+          rm -rf Pods/
+          rm -rf ~/Library/Developer/Xcode/DerivedData/
+      
+      - name: Remove Podfile.lock
+        run: |
+          cd ios
+          rm Podfile.lock
+        
+
+      - name: Install CocoaPods
+        working-directory: ./ios
+        run: |
+          gem install cocoapods
+          pod install --repo-update
+
+
+      - name: Decode and Install Certificate
+        run: |
+          echo "${{ secrets.CERTIFICATE_P12 }}" | base64 --decode > certificate.p12
+          ls -l certificate.p12
+          security create-keychain -p actions actions.keychain
+          security import certificate.p12 -k ~/Library/Keychains/actions.keychain -P ${{ secrets.CERTIFICATE_PASSWORD }} -T /usr/bin/codesign
+          security list-keychains -s ~/Library/Keychains/actions.keychain
+          security unlock-keychain -p actions ~/Library/Keychains/actions.keychain
+          security set-keychain-settings -t 3600 -u ~/Library/Keychains/actions.keychain
+
+      - name: Decode and Install Provisioning Profile
+        run: |
+          echo "${{ secrets.PROVISIONING_PROFILE }}" | base64 --decode > profile.mobileprovision
+          ls -l profile.mobileprovision
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          mv profile.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Increment build number
+        working-directory: ./ios
+        run: agvtool next-version -all
+
+
+      - name: Update Xcode Project Settings
+        run: |
+          cd ios
+          PROVISIONING_PROFILE_UUID=$(/usr/libexec/PlistBuddy -c "Print :UUID" /dev/stdin <<< $(/usr/bin/security cms -D -i ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision))
+          /usr/libexec/PlistBuddy -c "Add :provisioningProfiles:$PROVISIONING_PROFILE_UUID string profile.mobileprovision" -c "Set :provisioningProfiles:$PROVISIONING_PROFILE_UUID ~/Library/MobileDevice/Provisioning\ Profiles/profile.mobileprovision" ~/Library/Preferences/com.apple.dt.Xcode.plist
+      
+      - name: Build and Archive iOS App
+        run: |
+          flutter build ios --release --obfuscate --split-debug-info=build/app/outputs/symbols
+          mkdir -p build/ios
+          cp -r build/ios/iphoneos/* build/ios
+          xcodebuild -allowProvisioningUpdates -exportArchive -archivePath build/ios/Runner.xcarchive -exportOptionsPlist exportOptions.plist -exportPath build/ios
+
+
+      - name: Upload to TestFlight
+        working-directory: ./ios
+        env:
+          APP_STORE_CONNECT_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          APP_STORE_CONNECT_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+          APP_STORE_CONNECT_API_KEY: ${{ secrets.APP_STORE_CONNECT_API_KEY }}
+        run: |
+          fastlane pilot upload --ipa ios/build/Runner.ipa
+          fastlane pilot upload --ipa $PWD/build/Runner.ipa
